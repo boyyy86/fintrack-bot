@@ -3,9 +3,10 @@ package main
 import (
 	"bytes"
 	"database/sql"
+	"encoding/csv"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -14,38 +15,33 @@ import (
 	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
+	"github.com/robfig/cron/v3"
+	"github.com/wcharczuk/go-chart/v2"
 	_ "modernc.org/sqlite"
 )
 
-// --- VARIABEL GLOBAL AI ---
-var groqAPIKey string
-var activeModel string
-const groqEndpoint = "https://api.groq.com/openai/v1/chat/completions"
-
-// --- STRUKTUR DATA & DATABASE ---
-type Transaksi struct {
-	ID      int
-	UserID  int64
-	Item    string
-	Nominal int64
-	IsMasuk bool
-	Waktu   time.Time
-}
-
+// --- VARIABEL GLOBAL ---
 var db *sql.DB
+var groqAPIKey string
+var bot *tgbotapi.BotAPI
+var adminID int64
 
+// --- 1. DATABASE & KEAMANAN ---
 func initDB() {
 	var err error
 	db, err = sql.Open("sqlite", "data_keuangan.db")
 	if err != nil {
 		log.Fatal("Gagal membuka database: ", err)
 	}
+
+	// Skema tabel utama
 	query := `
 	CREATE TABLE IF NOT EXISTS transaksi (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		user_id INTEGER,
 		item TEXT,
 		nominal INTEGER,
+		kategori TEXT,
 		is_masuk BOOLEAN,
 		waktu DATETIME
 	);`
@@ -53,19 +49,20 @@ func initDB() {
 	if err != nil {
 		log.Fatal("Gagal membuat tabel:", err)
 	}
+
+	// Auto-Migrate: Tambahkan kolom kategori jika database dari versi lama
+	db.Exec(`ALTER TABLE transaksi ADD COLUMN kategori TEXT DEFAULT 'Umum'`)
 }
 
-func CatatTransaksi(userID int64, item string, nominal int64, isMasuk bool) error {
-	query := `INSERT INTO transaksi (user_id, item, nominal, is_masuk, waktu) VALUES (?, ?, ?, ?, ?)`
-	_, err := db.Exec(query, userID, item, nominal, isMasuk, time.Now())
+func CatatTransaksi(userID int64, item string, nominal int64, kategori string, isMasuk bool) error {
+	query := `INSERT INTO transaksi (user_id, item, nominal, kategori, is_masuk, waktu) VALUES (?, ?, ?, ?, ?, ?)`
+	_, err := db.Exec(query, userID, item, nominal, kategori, isMasuk, time.Now())
 	return err
 }
 
 func HitungSaldo(userID int64) (int64, int64, int64) {
-	query := `SELECT is_masuk, nominal FROM transaksi WHERE user_id = ?`
-	rows, err := db.Query(query, userID)
+	rows, err := db.Query(`SELECT is_masuk, nominal FROM transaksi WHERE user_id = ?`, userID)
 	if err != nil {
-		log.Println("Error membaca data:", err)
 		return 0, 0, 0
 	}
 	defer rows.Close()
@@ -74,136 +71,115 @@ func HitungSaldo(userID int64) (int64, int64, int64) {
 	for rows.Next() {
 		var isMasuk bool
 		var nominal int64
-		err := rows.Scan(&isMasuk, &nominal)
-		if err != nil {
-			continue
-		}
-		if isMasuk {
-			totalMasuk += nominal
-		} else {
-			totalKeluar += nominal
+		if err := rows.Scan(&isMasuk, &nominal); err == nil {
+			if isMasuk {
+				totalMasuk += nominal
+			} else {
+				totalKeluar += nominal
+			}
 		}
 	}
 	return totalMasuk, totalKeluar, totalMasuk - totalKeluar
 }
 
-// --- FUNGSI PARSING TEKS ---
-func NormalisasiNominal(teks string) int64 {
-	teks = strings.ToLower(teks)
-	teks = strings.ReplaceAll(teks, "rp", "")
-	teks = strings.ReplaceAll(teks, " ", "")
-
-	var pengali float64 = 1
-	if strings.HasSuffix(teks, "rb") {
-		pengali = 1000
-		teks = strings.TrimSuffix(teks, "rb")
-	} else if strings.HasSuffix(teks, "k") {
-		pengali = 1000
-		teks = strings.TrimSuffix(teks, "k")
-	} else if strings.HasSuffix(teks, "jt") {
-		pengali = 1000000
-		teks = strings.TrimSuffix(teks, "jt")
-	}
-
-	if pengali > 1 {
-		teks = strings.ReplaceAll(teks, ",", ".")
-	} else {
-		teks = strings.ReplaceAll(teks, ".", "")
-		teks = strings.ReplaceAll(teks, ",", "")
-	}
-
-	angkaMentah, err := strconv.ParseFloat(teks, 64)
+// --- 2. FITUR EKSPOR CSV ---
+func EksporDataCSV(userID int64) ([]byte, error) {
+	rows, err := db.Query(`SELECT waktu, is_masuk, kategori, item, nominal FROM transaksi WHERE user_id = ? ORDER BY waktu ASC`, userID)
 	if err != nil {
-		return 0
+		return nil, err
 	}
-	return int64(angkaMentah * pengali)
-}
+	defer rows.Close()
 
-func BedahPesan(pesan string) (perintah string, item string, nominal int64, isValid bool) {
-	kata := strings.Fields(pesan)
-	if len(kata) < 2 {
-		return "", "", 0, false
-	}
-	perintah = kata[0]
-	teksNominal := kata[len(kata)-1]
-	if len(kata) > 2 {
-		item = strings.Join(kata[1:len(kata)-1], " ")
-	} else {
-		item = "Tanpa Keterangan"
-	}
-	nominal = NormalisasiNominal(teksNominal)
-	if nominal == 0 {
-		return "", "", 0, false
-	}
-	return perintah, item, nominal, true
-}
+	var buf bytes.Buffer
+	writer := csv.NewWriter(&buf)
+	writer.Write([]string{"Tanggal", "Tipe", "Kategori", "Item", "Nominal"}) // Header
 
-// --- FUNGSI AI GROQ ---
-func temukanModelYangJalan() string {
-	log.Println("1. Mengambil daftar model dari server Groq...")
-	req, _ := http.NewRequest("GET", "https://api.groq.com/openai/v1/models", nil)
-	req.Header.Set("Authorization", "Bearer "+groqAPIKey)
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		log.Println("Gagal koneksi ke Groq:", err)
-		return "llama-3.1-8b-instant" // fallback darurat
-	}
-	defer resp.Body.Close()
+	for rows.Next() {
+		var waktu time.Time
+		var isMasuk bool
+		var kategori, item string
+		var nominal int64
 
-	body, _ := ioutil.ReadAll(resp.Body)
-	var result map[string]interface{}
-	json.Unmarshal(body, &result)
-
-	data, ok := result["data"].([]interface{})
-	if !ok {
-		return "llama-3.1-8b-instant"
-	}
-
-	log.Println("2. Mengetes kecocokan model satu per satu...")
-	for _, v := range data {
-		m := v.(map[string]interface{})
-		id := m["id"].(string)
-
-		if strings.Contains(id, "whisper") || strings.Contains(id, "guard") || strings.Contains(id, "canopy") {
-			continue
+		if err := rows.Scan(&waktu, &isMasuk, &kategori, &item, &nominal); err == nil {
+			tipe := "Keluar"
+			if isMasuk {
+				tipe = "Masuk"
+			}
+			writer.Write([]string{
+				waktu.Format("2006-01-02 15:04"),
+				tipe,
+				kategori,
+				item,
+				fmt.Sprintf("%d", nominal),
+			})
 		}
-
-		log.Printf("   -> Mengetes koneksi ke: %s ... ", id)
-		// Kita ambil model pertama yang valid agar cepat
-		return id 
 	}
-	return "llama-3.1-8b-instant"
+	writer.Flush()
+	return buf.Bytes(), nil
 }
 
-func panggilAI(prompt string) string {
-	if activeModel == "" {
-		activeModel = temukanModelYangJalan()
+// --- 3. FITUR GRAFIK VISUAL ---
+func BuatGrafikPengeluaran(userID int64) ([]byte, error) {
+	rows, err := db.Query(`SELECT kategori, SUM(nominal) FROM transaksi WHERE user_id = ? AND is_masuk = false GROUP BY kategori`, userID)
+	if err != nil {
+		return nil, err
 	}
+	defer rows.Close()
+
+	var chartValues []chart.Value
+	for rows.Next() {
+		var kategori string
+		var total float64
+		if err := rows.Scan(&kategori, &total); err == nil {
+			chartValues = append(chartValues, chart.Value{Value: total, Label: kategori})
+		}
+	}
+
+	if len(chartValues) == 0 {
+		return nil, fmt.Errorf("Belum ada data pengeluaran")
+	}
+
+	pie := chart.PieChart{
+		Width:  512,
+		Height: 512,
+		Values: chartValues,
+	}
+
+	var buf bytes.Buffer
+	err = pie.Render(chart.PNG, &buf)
+	return buf.Bytes(), err
+}
+
+// --- 4. OTAK NLP (NATURAL LANGUAGE PROCESSING) VIA GROQ ---
+type NLPResult struct {
+	Item     string `json:"item"`
+	Nominal  int64  `json:"nominal"`
+	Kategori string `json:"kategori"`
+}
+
+func EkstrakPesanDenganAI(pesan string) (NLPResult, error) {
+	var hasil NLPResult
+	prompt := fmt.Sprintf(`Ekstrak data pengeluaran berikut ke dalam format JSON. 
+Data pengguna: "%s"
+Hanya kembalikan JSON mentah tanpa markdown, tanpa penjelasan. Kategori yang tersedia: Makanan, Transportasi, Hiburan, Tagihan, Lainnya.
+Format wajib: {"item": "nama barang", "nominal": angka_tanpa_titik, "kategori": "nama_kategori"}`, pesan)
 
 	reqBody, _ := json.Marshal(map[string]interface{}{
-		"model": activeModel,
+		"model": "llama-3.1-8b-instant",
 		"messages": []map[string]string{
-			{
-				"role": "system",
-				"content": "Kamu adalah asisten keuangan yang tegas dan mendukung. Berikan evaluasi singkat dari data yang dikirim pengguna. Sebutkan apakah status keuangannya AMAN, WASPADA, atau KRITIS. Berikan 1 kalimat saran objektif.",
-			},
-			{
-				"role": "user",
-				"content": prompt,
-			},
+			{"role": "user", "content": prompt},
 		},
-		"max_tokens": 150,
+		"temperature": 0.1, // Dibuat dingin agar tidak berhalusinasi teks
 	})
 
-	req, _ := http.NewRequest("POST", groqEndpoint, bytes.NewBuffer(reqBody))
+	req, _ := http.NewRequest("POST", "https://api.groq.com/openai/v1/chat/completions", bytes.NewBuffer(reqBody))
 	req.Header.Set("Authorization", "Bearer "+groqAPIKey)
 	req.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{Timeout: 15 * time.Second}
+	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		return "Maaf, AI sedang sibuk. Namun tenang saja, data saldo Anda telah tersimpan dan dihitung dengan aman di dalam database lokal."
+		return hasil, err
 	}
 	defer resp.Body.Close()
 
@@ -211,37 +187,97 @@ func panggilAI(prompt string) string {
 	json.NewDecoder(resp.Body).Decode(&result)
 
 	if choices, ok := result["choices"].([]interface{}); ok && len(choices) > 0 {
-		if message, ok := choices[0].(map[string]interface{})["message"].(map[string]interface{}); ok {
-			if content, ok := message["content"].(string); ok {
+		if msg, ok := choices[0].(map[string]interface{})["message"].(map[string]interface{}); ok {
+			if content, ok := msg["content"].(string); ok {
+				// Bersihkan jika AI masih bandel menyertakan markdown
+				content = strings.TrimPrefix(content, "```json")
+				content = strings.TrimPrefix(content, "```")
+				content = strings.TrimSuffix(content, "```")
+
+				err := json.Unmarshal([]byte(content), &hasil)
+				return hasil, err
+			}
+		}
+	}
+	return hasil, fmt.Errorf("Gagal mengekstrak")
+}
+
+// Fungsi Evaluasi AI Lama (dipertahankan)
+func panggilAIEvaluasi(prompt string) string {
+	reqBody, _ := json.Marshal(map[string]interface{}{
+		"model": "llama-3.1-8b-instant",
+		"messages": []map[string]string{
+			{"role": "system", "content": "Kamu asisten keuangan tegas. Evaluasi status (Aman/Waspada/Kritis) dan beri saran 1 kalimat."},
+			{"role": "user", "content": prompt},
+		},
+	})
+	req, _ := http.NewRequest("POST", "[https://api.groq.com/openai/v1/chat/completions](https://api.groq.com/openai/v1/chat/completions)", bytes.NewBuffer(reqBody))
+	req.Header.Set("Authorization", "Bearer "+groqAPIKey)
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "AI sedang sibuk."
+	}
+	defer resp.Body.Close()
+
+	var result map[string]interface{}
+	json.NewDecoder(resp.Body).Decode(&result)
+	if choices, ok := result["choices"].([]interface{}); ok && len(choices) > 0 {
+		if msg, ok := choices[0].(map[string]interface{})["message"].(map[string]interface{}); ok {
+			if content, ok := msg["content"].(string); ok {
 				return content
 			}
 		}
 	}
-	return "Berhasil menghitung saldo, tetapi gagal merangkai teks AI."
+	return "Gagal merangkai teks evaluasi."
 }
 
-// --- FUNGSI UTAMA ---
+// --- 5. SCHEDULER PENGINGAT (CRON JOB) ---
+func mulaiPengingatOtomatis() {
+	loc, _ := time.LoadLocation("Asia/Jakarta")
+	c := cron.New(cron.WithLocation(loc))
+
+	// Berdetak setiap hari jam 20:00 WIB
+	c.AddFunc("0 20 * * *", func() {
+		if adminID != 0 {
+			pesan := "Malam! 🌙 Jangan lupa catat pengeluaranmu hari ini ya, sebelum beristirahat."
+			bot.Send(tgbotapi.NewMessage(adminID, pesan))
+		}
+	})
+	c.Start()
+}
+
+// --- FUNGSI UTAMA (MAIN LOOP) ---
 func main() {
-	// 1. Tarik API Key dari Environment Back4App
+	// Fitur Keamanan Ekstrem: Anti-Crash (Goroutine Recover)
+	defer func() {
+		if r := recover(); r != nil {
+			log.Println("Sistem memulihkan diri dari Crash fatal:", r)
+		}
+	}()
+
 	groqAPIKey = os.Getenv("GROQ_API_KEY")
 	telegramToken := os.Getenv("TELEGRAM_TOKEN")
-	
-	if telegramToken == "" {
-		log.Fatal("Error: TELEGRAM_TOKEN belum dipasang")
+	adminIDStr := os.Getenv("ADMIN_CHAT_ID")
+
+	if adminIDStr != "" {
+		adminID, _ = strconv.ParseInt(adminIDStr, 10, 64)
 	}
 
-	// 2. Nyalakan Database SQLite
 	initDB()
-	log.Println("Database SQLite berhasil disiapkan!")
+	log.Println("Database & Kategori Siap!")
 
-	// 3. Hubungkan ke Telegram
-	bot, err := tgbotapi.NewBotAPI(telegramToken)
+	var err error
+	bot, err = tgbotapi.NewBotAPI(telegramToken)
 	if err != nil {
-		log.Panic("Gagal koneksi ke Telegram: ", err)
+		log.Panic("Gagal koneksi ke Telegram")
 	}
-	log.Printf("Bot %s berhasil hidup", bot.Self.UserName)
 
-	// 4. Dengarkan Pesan Masuk
+	mulaiPengingatOtomatis()
+	log.Printf("Bot %s siap dengan sistem NLP, Scheduler, dan Grafik!", bot.Self.UserName)
+
 	u := tgbotapi.NewUpdate(0)
 	u.Timeout = 60
 	updates := bot.GetUpdatesChan(u)
@@ -254,33 +290,84 @@ func main() {
 		pesanMasuk := update.Message.Text
 		userID := update.Message.Chat.ID
 
-		perintah, item, nominal, isValid := BedahPesan(pesanMasuk)
+		// Fitur Keamanan: Whitelist Chat ID
+		if adminID != 0 && userID != adminID {
+			bot.Send(tgbotapi.NewMessage(userID, "Maaf, bot ini terkunci untuk penggunaan pribadi."))
+			continue
+		}
 
-		switch perintah {
-		case "/start":
-			balasan := "Halo! Saya asisten keuangan barumu.\nKetik /masuk [nominal] untuk saldo awal.\nKetik /catat [keterangan] [nominal] untuk pengeluaran.\nKetik /evaluasi untuk analisis AI."
-			bot.Send(tgbotapi.NewMessage(userID, balasan))
+		// Jika pengguna belum set ADMIN_CHAT_ID di env, kita tangkap dari chat pertama
+		if adminID == 0 {
+			adminID = userID
+			log.Println("Admin ID terdaftar otomatis:", adminID)
+		}
 
-		case "/masuk":
-			if !isValid {
-				bot.Send(tgbotapi.NewMessage(userID, "Format salah. Contoh: /masuk dana awal 1,5jt"))
-				continue
+		// Rute Perintah
+		if strings.HasPrefix(pesanMasuk, "/") {
+			kata := strings.Fields(pesanMasuk)
+			perintah := kata[0]
+
+			switch perintah {
+			case "/start":
+				bot.Send(tgbotapi.NewMessage(userID, "Sistem Otonom Aktif.\n/masuk [nominal]\n/evaluasi\n/ekspor (Unduh CSV)\n/laporan (Grafik Pie)\nAtau cukup ketik cerita santai, misal: 'Tadi makan bakso 25rb'."))
+
+			case "/masuk":
+				if len(kata) < 2 {
+					bot.Send(tgbotapi.NewMessage(userID, "Contoh: /masuk 1500000"))
+					continue
+				}
+				nominal, _ := strconv.ParseInt(kata[1], 10, 64)
+				CatatTransaksi(userID, "Pemasukan Saldo", nominal, "Pemasukan", true)
+				bot.Send(tgbotapi.NewMessage(userID, fmt.Sprintf("✅ Dana Rp%d berhasil ditambahkan!", nominal)))
+
+			case "/ekspor":
+				fileBytes, err := EksporDataCSV(userID)
+				if err != nil {
+					bot.Send(tgbotapi.NewMessage(userID, "Gagal membuat file CSV."))
+					continue
+				}
+				file := tgbotapi.FileBytes{Name: "Laporan_Keuangan.csv", Bytes: fileBytes}
+				msg := tgbotapi.NewDocument(userID, file)
+				msg.Caption = "Ini data mentahmu, silakan buka di Excel."
+				bot.Send(msg)
+
+			case "/laporan":
+				bot.Send(tgbotapi.NewMessage(userID, "🎨 Sedang menggambar grafik pengeluaran..."))
+				imgBytes, err := BuatGrafikPengeluaran(userID)
+				if err != nil {
+					bot.Send(tgbotapi.NewMessage(userID, "Belum cukup data untuk membuat grafik."))
+					continue
+				}
+				photo := tgbotapi.FileBytes{Name: "grafik.png", Bytes: imgBytes}
+				msg := tgbotapi.NewPhoto(userID, photo)
+				msg.Caption = "Persentase Pengeluaran Berdasarkan Kategori"
+				bot.Send(msg)
+
+			case "/evaluasi":
+				bot.Send(tgbotapi.NewMessage(userID, "⏳ Menghitung & meminta evaluasi AI..."))
+				pemasukan, pengeluaran, sisa := HitungSaldo(userID)
+				fakta := fmt.Sprintf("Data absolut: Masuk Rp%d, Keluar Rp%d, Sisa Rp%d.", pemasukan, pengeluaran, sisa)
+				bot.Send(tgbotapi.NewMessage(userID, panggilAIEvaluasi(fakta)))
+
+			default:
+				bot.Send(tgbotapi.NewMessage(userID, "Perintah tidak dikenali."))
 			}
-			CatatTransaksi(userID, "Pemasukan: "+item, nominal, true)
-			bot.Send(tgbotapi.NewMessage(userID, fmt.Sprintf("✅ Dana sebesar Rp%d berhasil ditambahkan!", nominal)))
+			continue
+		}
 
-		case "/catat":
-			if !isValid {
-				bot.Send(tgbotapi.NewMessage(userID, "Format salah. Contoh: /catat Beli Makan 50rb"))
-				continue
-			}
-			CatatTransaksi(userID, item, nominal, false)
-			bot.Send(tgbotapi.NewMessage(userID, fmt.Sprintf("📉 Pengeluaran Rp%d (%s) berhasil dicatat!", nominal, item)))
+		// JIKA BUKAN PERINTAH "/", ANGGAP SEBAGAI INPUT BAHASA NATURAL NLP
+		bot.Send(tgbotapi.NewMessage(userID, "🧠 AI sedang membedah pesanmu..."))
 
-		case "/evaluasi":
-			bot.Send(tgbotapi.NewMessage(userID, "⏳ Menghitung buku besar dan meminta evaluasi AI..."))
-			
-			// Ambil hitungan angka pasti dari Go
-			pemasukan, pengeluaran, sisa := HitungSaldo(userID)
-			
-			// Kirim hasilnya sebagai fakta teks
+		hasilNLP, err := EkstrakPesanDenganAI(pesanMasuk)
+		if err != nil || hasilNLP.Nominal == 0 {
+			bot.Send(tgbotapi.NewMessage(userID, "Maaf, AI gagal menangkap nominal/kategori dari pesanmu. Coba bahasa yang lebih jelas."))
+			continue
+		}
+
+		// Simpan hasil terjemahan AI ke SQLite
+		CatatTransaksi(userID, hasilNLP.Item, hasilNLP.Nominal, hasilNLP.Kategori, false)
+
+		balasan := fmt.Sprintf("✅ **Tercatat Otomatis**\nItem: %s\nNominal: Rp%d\nKategori: %s", hasilNLP.Item, hasilNLP.Nominal, hasilNLP.Kategori)
+		bot.Send(tgbotapi.NewMessage(userID, balasan))
+	}
+}
