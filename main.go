@@ -277,6 +277,20 @@ func main() {
 	mulaiPengingatOtomatis()
 	log.Printf("Bot %s siap dengan sistem NLP, Scheduler, dan Grafik!", bot.Self.UserName)
 
+	// --- SERVER DUMMY UNTUK KELABUI HEALTH-CHECK BACK4APP ---
+	go func() {
+		http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+			w.Write([]byte("Status: Sehat. Bot Telegram sedang berjalan di background!"))
+		})
+		port := os.Getenv("PORT")
+		if port == "" {
+			port = "8080"
+		}
+		log.Println("Menyalakan server web dummy di port:", port)
+		http.ListenAndServe(":"+port, nil)
+	}()
+	// --------------------------------------------------------
+
 	u := tgbotapi.NewUpdate(0)
 	u.Timeout = 60
 	updates := bot.GetUpdatesChan(u)
