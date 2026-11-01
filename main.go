@@ -322,7 +322,32 @@ func main() {
 
 			switch perintah {
 			case "/start":
-				bot.Send(tgbotapi.NewMessage(userID, "Sistem Otonom Aktif.\n/masuk [nominal]\n/evaluasi\n/ekspor (Unduh CSV)\n/laporan (Grafik Pie)\nAtau cukup ketik cerita santai, misal: 'Tadi makan bakso 25rb'."))
+				balasan := "🤖💼 *AI Financial Workspace Aktif* ✨\n" +
+					"━━━━━━━━━━━━━━━━━━━━\n" +
+					"Sistem pelacakan 📡 dan analisis arus kas 📈 telah beroperasi. Saya siap mencatat ✍️, memvisualisasikan 📊, dan mengaudit 🔍 data keuangan Anda secara real-time.\n\n" +
+					"🧠🗣️ *Input Bahasa Natural (NLP)*\n" +
+					"Abaikan format kaku! 🙅‍♂️ Cukup laporkan transaksi Anda layaknya berbicara santai kepada teman ☕.\n" +
+					"💬 _\"Tadi siang habis ngopi di Trawas 35rb\"_ 💸\n\n" +
+					"🚀⚙️ *Menu Manual & Aksi Cepat:*\n" +
+					"Ketik `/masuk [nominal]` 💰 untuk tambah saldo, atau sentuh **Tombol Aksi Cepat** 📱 di bawah layar untuk fitur lainnya! 🎉"
+
+				msg := tgbotapi.NewMessage(userID, balasan)
+				msg.ParseMode = "Markdown"
+
+				// Tombol tetap bersih dari emoji agar sistem mesin Go tidak bingung saat membaca perintah
+				tombolAksi := tgbotapi.NewReplyKeyboard(
+					tgbotapi.NewKeyboardButtonRow(
+						tgbotapi.NewKeyboardButton("/laporan"),
+						tgbotapi.NewKeyboardButton("/evaluasi"),
+					),
+					tgbotapi.NewKeyboardButtonRow(
+						tgbotapi.NewKeyboardButton("/ekspor"),
+					),
+				)
+				tombolAksi.ResizeKeyboard = true
+				msg.ReplyMarkup = tombolAksi
+
+				bot.Send(msg)
 
 			case "/masuk":
 				if len(kata) < 2 {
